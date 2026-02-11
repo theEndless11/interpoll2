@@ -1,0 +1,29 @@
+{
+  "name": "gun-relay-server",
+  "version": "1.0.0",
+  "description": "Gun.js P2P relay server for decentralized data sync",
+  "type": "module",
+  "main": "gun-relay.js",
+  "scripts": {
+    "start": "node gun-relay.js",
+    "dev": "node gun-relay.js"
+  },
+  "keywords": [
+    "gun",
+    "gunjs",
+    "p2p",
+    "relay",
+    "decentralized",
+    "realtime"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "gun": "^0.2020.1240",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
