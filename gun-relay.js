@@ -1,4 +1,3 @@
-
 // gun-relay.js
 // Gun.js relay server with MySQL persistence (Hostinger MySQL)
 
@@ -70,6 +69,12 @@ function wireMySQL(gun) {
   gun.on('put', async function (msg) {
     this.to.next(msg);
     if (!msg?.put) return;
+    console.log("GUN PUT keys:", JSON.stringify(Object.keys(msg.put)));
+    for (const [soul, node] of Object.entries(msg.put)) {
+      if (node && typeof node === "object" && !node["#"]) {
+        console.log(`GUN DATA [${soul}]:`, JSON.stringify(node).slice(0, 200));
+      }
+    }
     try {
       const batch = [];
       for (const [soul, node] of Object.entries(msg.put)) {
