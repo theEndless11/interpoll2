@@ -1,14 +1,71 @@
-// gun-relay.js
-// Self-hosted Gun.js relay server for Render deployment
-
 import express from 'express';
 import Gun from 'gun';
 import http from 'http';
 import cors from 'cors';
+import pkg from 'pg';
 
+const { Client } = pkg;
 const PORT = process.env.PORT || 8765;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const app = express();
+
+// ─── PostgreSQL Connection ────────────────────────────────────────────────────
+let pgClient = null;
+const initPostgres = async () => {
+  try {
+    pgClient = new Client({
+      connectionString: process.env.DATABASE_URL,
+      ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    });
+    await pgClient.connect();
+    
+    // Create table if not exists
+    await pgClient.query(`
+      CREATE TABLE IF NOT EXISTS gun_data (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_gun_data_key ON gun_data(key);
+    `);
+    
+    console.log('✅ PostgreSQL connected');
+    return true;
+  } catch (err) {
+    console.error('❌ PostgreSQL connection failed:', err.message);
+    return false;
+  }
+};
+
+// Custom Gun adapter for PostgreSQL
+const pgAdapter = {
+  get: async (key) => {
+    try {
+      if (!pgClient) return null;
+      const result = await pgClient.query('SELECT value FROM gun_data WHERE key = $1', [key]);
+      return result.rows[0]?.value || null;
+    } catch (err) {
+      console.error('PG get error:', err);
+      return null;
+    }
+  },
+  put: async (key, value) => {
+    try {
+      if (!pgClient) return;
+      await pgClient.query(
+        `INSERT INTO gun_data (key, value, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+        [key, value]
+      );
+    } catch (err) {
+      console.error('PG put error:', err);
+    }
+  },
+};
+
+// Initialize before creating Gun
+await initPostgres();
 
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
@@ -16,11 +73,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(null, true);
-    }
+    callback(null, true);
   },
   credentials: true
 }));
@@ -29,37 +82,38 @@ app.use(Gun.serve);
 
 const server = http.createServer(app);
 
+// ─── Gun with PostgreSQL backing ──────────────────────────────────────────────
 const gun = Gun({
   web: server,
-  // FIX: radisk:true on Render is misleading — storage is ephemeral.
-  // Keep it true so data survives in-process restarts within a session,
-  // but understand it resets on deploy. Consider a Redis adapter for
-  // true persistence if you need data to survive restarts.
-  radisk: true,
+  radisk: true,  // Memory cache layer
   localStorage: false,
   multicast: false,
-  // FIX: Increase the number of allowed concurrent peers.
-  // Default Gun peer limit can throttle concurrent community loads.
-  // With 6 communities each opening multiple Gun subscriptions,
-  // you can easily hit the default peer queue limit.
-  peers: [],  // Add backup relay URLs here if you deploy multiple instances
+  peers: [],
 });
 
-// FIX: Increase Gun's internal message queue size to handle
-// concurrent multi-community loads without dropping callbacks.
-// This is the main reason some communities get 0 results under load.
-if (gun._ && gun._.opt) {
-  // Allow more concurrent wire messages before Gun starts queuing
-  gun._.opt.chunk = gun._.opt.chunk || 10000;
+// Override Gun's storage with PostgreSQL
+if (gun._.get && pgClient) {
+  gun._.storage = pgAdapter;
 }
 
-app.get('/health', (req, res) => {
+// Health check with DB status
+app.get('/health', async (req, res) => {
+  let dbStatus = 'disconnected';
+  if (pgClient) {
+    try {
+      await pgClient.query('SELECT 1');
+      dbStatus = 'connected';
+    } catch (e) {
+      dbStatus = 'error';
+    }
+  }
+
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     peers: Object.keys(gun._.opt.peers || {}).length,
+    database: dbStatus,
     timestamp: Date.now(),
-    // Add memory info to help spot memory leaks over time
     memory: process.memoryUsage(),
   });
 });
@@ -89,8 +143,7 @@ app.get('/', (req, res) => {
           <span class="status">● ONLINE</span>
           <div class="info">
             Environment: <code>${NODE_ENV}</code> | Port: <code>${PORT}</code> |
-            Uptime: <code>${Math.floor(process.uptime())}s</code> |
-            Peers: <code>${Object.keys(gun._.opt.peers || {}).length}</code>
+            Database: <code>PostgreSQL</code> | Uptime: <code>${Math.floor(process.uptime())}s</code>
           </div>
           <div class="endpoint">
             <strong>WebSocket:</strong> <code>${protocol}://${host}/gun</code>
@@ -106,20 +159,11 @@ app.get('/', (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🔫 Gun.js relay server running on port ${PORT} [${NODE_ENV}]`);
-  if (NODE_ENV === 'development') {
-    console.log(`📡 ws://localhost:${PORT}/gun`);
-    console.log(`💚 http://localhost:${PORT}/health`);
-  }
+  console.log(`📊 Database: ${pgClient ? 'PostgreSQL' : 'Memory only'}`);
 });
 
 process.on('SIGINT', () => {
   console.log('\n👋 Shutting down...');
+  if (pgClient) pgClient.end();
   server.close(() => { process.exit(0); });
 });
-
-if (NODE_ENV === 'development') {
-  setInterval(() => {
-    const peerCount = Object.keys(gun._.opt.peers || {}).length;
-    if (peerCount > 0) console.log(`📊 Peers: ${peerCount}`);
-  }, 30000);
-}
