@@ -8,21 +8,14 @@
     "start": "node gun-relay.js",
     "dev": "node gun-relay.js"
   },
-  "keywords": [
-    "gun",
-    "gunjs",
-    "p2p",
-    "relay",
-    "decentralized",
-    "realtime"
-  ],
+  "keywords": ["gun", "gunjs", "p2p", "relay", "decentralized", "realtime"],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "gun": "^0.2020.1240",
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "pg": "^8.11.5"
+    "mysql2": "^3.9.0"
   },
   "engines": {
     "node": ">=18.0.0"
