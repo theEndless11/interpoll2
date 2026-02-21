@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 8765;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const app = express();
+app.use(express.json());
 
 // ─── MySQL ────────────────────────────────────────────────────────────────────
 let db = null;
@@ -52,10 +53,8 @@ async function initMySQL() {
 await initMySQL();
 
 // ─── In-memory node accumulator ───────────────────────────────────────────────
-// Gun sends data field-by-field: { "#": soul, ".": field, ":": value, ">": ts }
-// We accumulate fields per soul and flush to MySQL periodically
-const nodeBuffer = new Map(); // soul -> { field: value, ... }
-const flushTimers = new Map(); // soul -> timer
+const nodeBuffer = new Map();
+const flushTimers = new Map();
 
 async function flushNode(soul) {
   if (!dbConnected || !nodeBuffer.has(soul)) return;
@@ -78,8 +77,6 @@ async function flushNode(soul) {
 function bufferField(soul, field, value) {
   if (!nodeBuffer.has(soul)) nodeBuffer.set(soul, {});
   nodeBuffer.get(soul)[field] = value;
-
-  // Debounce flush — wait 200ms after last field for this soul
   if (flushTimers.has(soul)) clearTimeout(flushTimers.get(soul));
   flushTimers.set(soul, setTimeout(() => flushNode(soul), 200));
 }
@@ -88,25 +85,18 @@ function bufferField(soul, field, value) {
 function wireMySQL(gun) {
   if (!dbConnected) return;
 
-  // Intercept Gun's wire-level put — each msg is one field of one node
   gun.on('put', function (msg) {
     this.to.next(msg);
     const put = msg?.put;
     if (!put) return;
-
     const soul = put['#'];
     const field = put['.'];
     const value = put[':'];
-
     if (!soul || field === undefined || value === undefined) return;
-
-    // Skip Gun internal metadata souls
     if (soul.startsWith('~') || soul === 'undefined') return;
-
     bufferField(soul, field, value);
   });
 
-  // Load full node from MySQL on Gun get request
   gun.on('get', async function (msg) {
     this.to.next(msg);
     const soul = msg?.get?.['#'];
@@ -145,6 +135,108 @@ const gun = Gun({
 
 wireMySQL(gun);
 
+// ─── Direct MySQL REST API ────────────────────────────────────────────────────
+// These endpoints let relay-server.js query MySQL directly,
+// bypassing Gun's broken HTTP layer entirely.
+
+// GET /db/soul?soul=communities/c-cars/posts/post-xxx
+app.get('/db/soul', async (req, res) => {
+  const soul = req.query.soul;
+  if (!soul) return res.status(400).json({ error: 'missing soul param' });
+  if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
+  try {
+    const [rows] = await db.execute('SELECT data FROM gun_nodes WHERE soul = ?', [soul]);
+    if (rows.length === 0) return res.status(404).json({ error: 'not found' });
+    res.json({ soul, data: JSON.parse(rows[0].data) });
+  } catch (err) {
+    console.error('❌ /db/soul error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /db/search?prefix=communities/c-cars/posts/
+app.get('/db/search', async (req, res) => {
+  const prefix = req.query.prefix;
+  const limit = Math.min(parseInt(req.query.limit || '100'), 500);
+  if (!prefix) return res.status(400).json({ error: 'missing prefix param' });
+  if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
+  try {
+    // Escape LIKE special chars in prefix
+    const escapedPrefix = prefix.replace(/[%_\\]/g, '\\$&');
+    const [rows] = await db.execute(
+      'SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? LIMIT ?',
+      [`${escapedPrefix}%`, '\\', limit]
+    );
+    res.json({
+      results: rows.map(r => {
+        try { return { soul: r.soul, data: JSON.parse(r.data) }; }
+        catch { return { soul: r.soul, data: {} }; }
+      })
+    });
+  } catch (err) {
+    console.error('❌ /db/search error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /db/find-post?postId=post-xxx  — searches all community paths for a post
+app.get('/db/find-post', async (req, res) => {
+  const postId = req.query.postId;
+  if (!postId) return res.status(400).json({ error: 'missing postId param' });
+  if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
+  try {
+    // Try exact community path pattern first
+    const escapedId = postId.replace(/[%_\\]/g, '\\$&');
+    const [rows] = await db.execute(
+      `SELECT soul, data FROM gun_nodes 
+       WHERE soul LIKE ? ESCAPE ? 
+       OR soul = ?
+       LIMIT 10`,
+      [`%/posts/${escapedId}`, '\\', `posts/${postId}`]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not found' });
+    // Pick the first row that has title
+    for (const row of rows) {
+      try {
+        const data = JSON.parse(row.data);
+        if (data?.title) return res.json({ soul: row.soul, data });
+      } catch { /* skip */ }
+    }
+    res.status(404).json({ error: 'not found' });
+  } catch (err) {
+    console.error('❌ /db/find-post error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /db/find-poll?pollId=poll-xxx
+app.get('/db/find-poll', async (req, res) => {
+  const pollId = req.query.pollId;
+  if (!pollId) return res.status(400).json({ error: 'missing pollId param' });
+  if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
+  try {
+    const escapedId = pollId.replace(/[%_\\]/g, '\\$&');
+    const [rows] = await db.execute(
+      `SELECT soul, data FROM gun_nodes 
+       WHERE soul LIKE ? ESCAPE ?
+       OR soul = ?
+       LIMIT 10`,
+      [`%/polls/${escapedId}`, '\\', `polls/${pollId}`]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not found' });
+    for (const row of rows) {
+      try {
+        const data = JSON.parse(row.data);
+        if (data?.question) return res.json({ soul: row.soul, data });
+      } catch { /* skip */ }
+    }
+    res.status(404).json({ error: 'not found' });
+  } catch (err) {
+    console.error('❌ /db/find-poll error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
   let dbRows = 0;
@@ -181,7 +273,7 @@ app.get('/', (req, res) => {
   <body><div class="card">
   <h1>🔫 Gun.js Relay</h1>
   <p>Status: <strong style="color:green">ONLINE</strong> | DB: <strong>${dbConnected ? '✅ MySQL' : '⚠️ Memory'}</strong></p>
-  <pre>WebSocket: ${proto}://${host}/gun\nHTTP:      ${http_}://${host}/gun\nHealth:    ${http_}://${host}/health</pre>
+  <pre>WebSocket : ${proto}://${host}/gun\nHTTP      : ${http_}://${host}/gun\nHealth    : ${http_}://${host}/health\nFind post : ${http_}://${host}/db/find-post?postId=POST_ID\nFind poll : ${http_}://${host}/db/find-poll?pollId=POLL_ID\nSoul      : ${http_}://${host}/db/soul?soul=SOUL\nSearch    : ${http_}://${host}/db/search?prefix=PREFIX</pre>
   </div></body></html>`);
 });
 
