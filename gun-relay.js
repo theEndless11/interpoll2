@@ -111,15 +111,17 @@ function wireMySQL(gun) {
     this.to.next(msg);
     const soul = msg?.get?.['#'];
     if (!soul) return;
+    let conn;
     try {
-      const [rows] = await db.execute('SELECT data FROM gun_nodes WHERE soul = ?', [soul]);
+      conn = await db.getConnection();
+      const [rows] = await conn.execute('SELECT data FROM gun_nodes WHERE soul = ?', [soul]);
       if (rows.length === 0) return;
       const node = JSON.parse(rows[0].data);
-      // Inject back into Gun graph
-      const put = { [soul]: node };
-      gun._.root.on('in', { '@': msg['#'], put });
+      gun._.root.on('in', { '@': msg['#'], put: { [soul]: node } });
     } catch (err) {
       console.error('❌ MySQL get error:', err.message);
+    } finally {
+      if (conn) conn.release();
     }
   });
 
