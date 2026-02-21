@@ -69,7 +69,8 @@ function wireMySQL(gun) {
   gun.on('put', async function (msg) {
     this.to.next(msg);
     if (!msg?.put) return;
-    console.log("GUN PUT keys:", JSON.stringify(Object.keys(msg.put)));
+    console.log("GUN PUT soul:", msg["#"], "put keys:", JSON.stringify(Object.keys(msg.put)));
+    console.log("GUN PUT full msg sample:", JSON.stringify(msg).slice(0, 500));
     for (const [soul, node] of Object.entries(msg.put)) {
       if (node && typeof node === "object" && !node["#"]) {
         console.log(`GUN DATA [${soul}]:`, JSON.stringify(node).slice(0, 200));
