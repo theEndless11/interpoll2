@@ -1,5 +1,5 @@
-// gun-relay.js
-// Gun.js relay server with MySQL persistence (Hostinger MySQL)
+// gun-relay-enhanced.js
+// Gun.js relay with MySQL persistence + Search indexing integration
 
 import express from 'express';
 import Gun from 'gun';
@@ -9,6 +9,7 @@ import mysql from 'mysql2/promise';
 
 const PORT = process.env.PORT || 8765;
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const RELAY_SERVER_URL = process.env.RELAY_SERVER_URL || 'http://localhost:8080';
 
 const app = express();
 app.use(express.json());
@@ -69,6 +70,13 @@ async function flushNode(soul) {
          updated_at = NOW()`,
       [soul, JSON.stringify(data)]
     );
+    
+    // Auto-index for search if it's a post or poll
+    if (soul.includes('/posts/') && data.title) {
+      await indexToRelayServer('post', data.id || soul.split('/').pop(), data);
+    } else if (soul.includes('/polls/') && data.question) {
+      await indexToRelayServer('poll', data.id || soul.split('/').pop(), data);
+    }
   } catch (err) {
     console.error('❌ MySQL flush error:', err.message);
   }
@@ -79,6 +87,22 @@ function bufferField(soul, field, value) {
   nodeBuffer.get(soul)[field] = value;
   if (flushTimers.has(soul)) clearTimeout(flushTimers.get(soul));
   flushTimers.set(soul, setTimeout(() => flushNode(soul), 200));
+}
+
+// ─── Search Indexing Integration ──────────────────────────────────────────────
+async function indexToRelayServer(type, id, data) {
+  try {
+    const response = await fetch(`${RELAY_SERVER_URL}/api/index`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, id, data }),
+    });
+    if (!response.ok) {
+      console.warn(`⚠️  Search indexing failed for ${type}:${id}`);
+    }
+  } catch (err) {
+    console.error('❌ Search indexing error:', err.message);
+  }
 }
 
 // ─── Gun Storage Adapter ──────────────────────────────────────────────────────
@@ -115,7 +139,7 @@ function wireMySQL(gun) {
     }
   });
 
-  console.log('✅ MySQL Gun storage adapter wired');
+  console.log('✅ MySQL Gun storage adapter wired with search indexing');
 }
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -136,10 +160,6 @@ const gun = Gun({
 wireMySQL(gun);
 
 // ─── Direct MySQL REST API ────────────────────────────────────────────────────
-// These endpoints let relay-server.js query MySQL directly,
-// bypassing Gun's broken HTTP layer entirely.
-
-// GET /db/soul?soul=communities/c-cars/posts/post-xxx
 app.get('/db/soul', async (req, res) => {
   const soul = req.query.soul;
   if (!soul) return res.status(400).json({ error: 'missing soul param' });
@@ -154,14 +174,12 @@ app.get('/db/soul', async (req, res) => {
   }
 });
 
-// GET /db/search?prefix=communities/c-cars/posts/
 app.get('/db/search', async (req, res) => {
   const prefix = req.query.prefix;
   const limit = Math.min(parseInt(req.query.limit || '100'), 500);
   if (!prefix) return res.status(400).json({ error: 'missing prefix param' });
   if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
   try {
-    // Escape LIKE special chars in prefix
     const escapedPrefix = prefix.replace(/[%_\\]/g, '\\$&');
     const [rows] = await db.execute(
       'SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? LIMIT ?',
@@ -179,13 +197,11 @@ app.get('/db/search', async (req, res) => {
   }
 });
 
-// GET /db/find-post?postId=post-xxx  — searches all community paths for a post
 app.get('/db/find-post', async (req, res) => {
   const postId = req.query.postId;
   if (!postId) return res.status(400).json({ error: 'missing postId param' });
   if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
   try {
-    // Try exact community path pattern first
     const escapedId = postId.replace(/[%_\\]/g, '\\$&');
     const [rows] = await db.execute(
       `SELECT soul, data FROM gun_nodes 
@@ -195,7 +211,6 @@ app.get('/db/find-post', async (req, res) => {
       [`%/posts/${escapedId}`, '\\', `posts/${postId}`]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'not found' });
-    // Pick the first row that has title
     for (const row of rows) {
       try {
         const data = JSON.parse(row.data);
@@ -209,7 +224,6 @@ app.get('/db/find-post', async (req, res) => {
   }
 });
 
-// GET /db/find-poll?pollId=poll-xxx
 app.get('/db/find-poll', async (req, res) => {
   const pollId = req.query.pollId;
   if (!pollId) return res.status(400).json({ error: 'missing pollId param' });
@@ -271,15 +285,18 @@ app.get('/', (req, res) => {
   .card{background:#fff;border-radius:12px;padding:40px;max-width:500px;width:100%}
   h1{margin-bottom:8px}pre{background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px}</style></head>
   <body><div class="card">
-  <h1>🔫 Gun.js Relay</h1>
+  <h1>🔫 Gun.js Relay (Enhanced)</h1>
   <p>Status: <strong style="color:green">ONLINE</strong> | DB: <strong>${dbConnected ? '✅ MySQL' : '⚠️ Memory'}</strong></p>
+  <p>Features: <strong>Search Indexing ✅</strong></p>
   <pre>WebSocket : ${proto}://${host}/gun\nHTTP      : ${http_}://${host}/gun\nHealth    : ${http_}://${host}/health\nFind post : ${http_}://${host}/db/find-post?postId=POST_ID\nFind poll : ${http_}://${host}/db/find-poll?pollId=POLL_ID\nSoul      : ${http_}://${host}/db/soul?soul=SOUL\nSearch    : ${http_}://${host}/db/search?prefix=PREFIX</pre>
   </div></body></html>`);
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🔫 Gun Relay on :${PORT} | DB: ${dbConnected ? '✅ MySQL' : '⚠️ Memory only'}`);
+  console.log(`🔫 Enhanced Gun Relay on :${PORT}`);
+  console.log(`   DB: ${dbConnected ? '✅ MySQL' : '⚠️ Memory only'}`);
+  console.log(`   Search: ✅ Auto-indexing to ${RELAY_SERVER_URL}`);
 });
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
@@ -305,4 +322,3 @@ setInterval(async () => {
     }
   }
 }, 30000);
-
