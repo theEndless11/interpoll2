@@ -53,6 +53,49 @@ async function initMySQL() {
 
 await initMySQL();
 
+// ─── Search Indexing Integration ──────────────────────────────────────────────
+async function indexToRelayServer(type, id, data) {
+  try {
+    const response = await fetch(`${RELAY_SERVER_URL}/api/index`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, id, data }),
+    });
+    if (!response.ok) {
+      console.warn(`⚠️  Search indexing failed for ${type}:${id} — ${response.status}`);
+    }
+  } catch (err) {
+    console.error('❌ Search indexing error:', err.message);
+  }
+}
+
+/**
+ * Given a fully-merged node from MySQL, index it if it's a post or poll.
+ * Uses regex to match only leaf post/poll souls (not parent index nodes).
+ */
+async function maybeIndexNode(soul, fullData) {
+  const isPost = /\/posts\/post-[^/]+$/.test(soul);
+  const isPoll = /\/polls\/poll-[^/]+$/.test(soul);
+
+  if (isPost && fullData.title) {
+    await indexToRelayServer('post', fullData.id || soul.split('/').pop(), {
+      title:         fullData.title,
+      content:       fullData.content || '',
+      authorName:    fullData.authorName || 'Anonymous',
+      communitySlug: fullData.communityId || '',
+      createdAt:     fullData.createdAt || Date.now(),
+    });
+  } else if (isPoll && fullData.question) {
+    await indexToRelayServer('poll', fullData.id || soul.split('/').pop(), {
+      question:      fullData.question,
+      description:   fullData.description || '',
+      authorName:    fullData.authorName || 'Anonymous',
+      communitySlug: fullData.communityId || '',
+      createdAt:     fullData.createdAt || Date.now(),
+    });
+  }
+}
+
 // ─── In-memory node accumulator ───────────────────────────────────────────────
 const nodeBuffer = new Map();
 const flushTimers = new Map();
@@ -70,12 +113,22 @@ async function flushNode(soul) {
          updated_at = NOW()`,
       [soul, JSON.stringify(data)]
     );
-    
-    // Auto-index for search if it's a post or poll
-    if (soul.includes('/posts/') && data.title) {
-      await indexToRelayServer('post', data.id || soul.split('/').pop(), data);
-    } else if (soul.includes('/polls/') && data.question) {
-      await indexToRelayServer('poll', data.id || soul.split('/').pop(), data);
+
+    // Fetch the fully-merged node from MySQL so we have ALL fields, not just
+    // the one field that was buffered in this flush cycle
+    const isPost = /\/posts\/post-[^/]+$/.test(soul);
+    const isPoll = /\/polls\/poll-[^/]+$/.test(soul);
+
+    if (isPost || isPoll) {
+      try {
+        const [rows] = await db.execute('SELECT data FROM gun_nodes WHERE soul = ?', [soul]);
+        if (rows.length > 0) {
+          const fullData = JSON.parse(rows[0].data);
+          await maybeIndexNode(soul, fullData);
+        }
+      } catch (err) {
+        console.error('❌ Auto-index fetch error:', err.message);
+      }
     }
   } catch (err) {
     console.error('❌ MySQL flush error:', err.message);
@@ -89,19 +142,56 @@ function bufferField(soul, field, value) {
   flushTimers.set(soul, setTimeout(() => flushNode(soul), 200));
 }
 
-// ─── Search Indexing Integration ──────────────────────────────────────────────
-async function indexToRelayServer(type, id, data) {
+// ─── Automatic Backfill ───────────────────────────────────────────────────────
+/**
+ * On startup, scan all gun_nodes for posts and polls that aren't yet in the
+ * search index and index them automatically. Runs once after DB connects.
+ */
+async function backfillSearchIndex() {
+  if (!dbConnected) return;
+  console.log('🔄 Starting search index backfill...');
+
   try {
-    const response = await fetch(`${RELAY_SERVER_URL}/api/index`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type, id, data }),
-    });
-    if (!response.ok) {
-      console.warn(`⚠️  Search indexing failed for ${type}:${id}`);
+    // Find all post and poll leaf nodes
+    const [rows] = await db.execute(`
+      SELECT soul, data FROM gun_nodes
+      WHERE soul REGEXP '/posts/post-[^/]+$'
+         OR soul REGEXP '/polls/poll-[^/]+$'
+    `);
+
+    if (rows.length === 0) {
+      console.log('ℹ️  No posts/polls found to backfill');
+      return;
     }
+
+    console.log(`📦 Found ${rows.length} nodes to backfill into search index`);
+
+    let indexed = 0;
+    let skipped = 0;
+
+    for (const row of rows) {
+      try {
+        const fullData = JSON.parse(row.data);
+        const isPost = /\/posts\/post-[^/]+$/.test(row.soul);
+        const isPoll = /\/polls\/poll-[^/]+$/.test(row.soul);
+
+        // Skip nodes that don't have enough data yet
+        if (isPost && !fullData.title) { skipped++; continue; }
+        if (isPoll && !fullData.question) { skipped++; continue; }
+
+        await maybeIndexNode(row.soul, fullData);
+        indexed++;
+
+        // Small delay to avoid hammering the relay server
+        await new Promise(r => setTimeout(r, 50));
+      } catch (err) {
+        console.error(`❌ Backfill error for ${row.soul}:`, err.message);
+      }
+    }
+
+    console.log(`✅ Backfill complete — indexed: ${indexed}, skipped: ${skipped}`);
   } catch (err) {
-    console.error('❌ Search indexing error:', err.message);
+    console.error('❌ Backfill failed:', err.message);
   }
 }
 
@@ -251,6 +341,13 @@ app.get('/db/find-poll', async (req, res) => {
   }
 });
 
+// ─── Manual backfill trigger endpoint ────────────────────────────────────────
+// Hit this anytime to re-index everything: GET /admin/reindex
+app.get('/admin/reindex', async (req, res) => {
+  res.json({ message: 'Backfill started, check server logs' });
+  backfillSearchIndex(); // run async, don't await
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
   let dbRows = 0;
@@ -287,8 +384,8 @@ app.get('/', (req, res) => {
   <body><div class="card">
   <h1>🔫 Gun.js Relay (Enhanced)</h1>
   <p>Status: <strong style="color:green">ONLINE</strong> | DB: <strong>${dbConnected ? '✅ MySQL' : '⚠️ Memory'}</strong></p>
-  <p>Features: <strong>Search Indexing ✅</strong></p>
-  <pre>WebSocket : ${proto}://${host}/gun\nHTTP      : ${http_}://${host}/gun\nHealth    : ${http_}://${host}/health\nFind post : ${http_}://${host}/db/find-post?postId=POST_ID\nFind poll : ${http_}://${host}/db/find-poll?pollId=POLL_ID\nSoul      : ${http_}://${host}/db/soul?soul=SOUL\nSearch    : ${http_}://${host}/db/search?prefix=PREFIX</pre>
+  <p>Features: <strong>Search Indexing ✅ | Auto Backfill ✅</strong></p>
+  <pre>WebSocket  : ${proto}://${host}/gun\nHTTP       : ${http_}://${host}/gun\nHealth     : ${http_}://${host}/health\nReindex    : ${http_}://${host}/admin/reindex\nFind post  : ${http_}://${host}/db/find-post?postId=POST_ID\nFind poll  : ${http_}://${host}/db/find-poll?pollId=POLL_ID\nSoul       : ${http_}://${host}/db/soul?soul=SOUL\nDB Search  : ${http_}://${host}/db/search?prefix=PREFIX</pre>
   </div></body></html>`);
 });
 
@@ -297,6 +394,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🔫 Enhanced Gun Relay on :${PORT}`);
   console.log(`   DB: ${dbConnected ? '✅ MySQL' : '⚠️ Memory only'}`);
   console.log(`   Search: ✅ Auto-indexing to ${RELAY_SERVER_URL}`);
+
+  // Auto-backfill on every startup — indexes anything not yet in search
+  if (dbConnected) {
+    setTimeout(backfillSearchIndex, 3000); // wait 3s for relay server to be ready
+  }
 });
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
