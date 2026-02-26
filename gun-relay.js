@@ -264,6 +264,42 @@ app.get('/db/soul', async (req, res) => {
   }
 });
 
+// POST /db/write — write a soul directly to MySQL and also inject into Gun graph
+// Used by seed.js to bypass unreliable WebSocket writes
+app.post('/db/write', async (req, res) => {
+  const { soul, data } = req.body;
+  if (!soul || data === undefined) return res.status(400).json({ error: 'missing soul or data' });
+  if (!dbConnected) return res.status(503).json({ error: 'db not connected' });
+  try {
+    const json = JSON.stringify(data);
+    await db.execute(
+      `INSERT INTO gun_nodes (soul, data) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE
+         data = JSON_MERGE_PATCH(data, VALUES(data)),
+         updated_at = NOW()`,
+      [soul, json]
+    );
+
+    // Also inject into Gun's live graph so connected clients get real-time update
+    const parts = soul.replace(/^v2\//, '').split('/');
+    let node = gun.get('v2');
+    for (const part of parts) node = node.get(part);
+    node.put(data);
+
+    // Trigger search indexing for post/poll leaf nodes
+    const isPost = /\/posts\/post-[^/]+$/.test(soul);
+    const isPoll = /\/polls\/poll-[^/]+$/.test(soul);
+    if ((isPost && data.title) || (isPoll && data.question)) {
+      await maybeIndexNode(soul, data);
+    }
+
+    res.json({ ok: true, soul });
+  } catch (err) {
+    console.error('❌ /db/write error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/db/search', async (req, res) => {
   const prefix = req.query.prefix;
   const limit = Math.min(parseInt(req.query.limit || '100'), 500);
